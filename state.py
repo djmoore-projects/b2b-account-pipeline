@@ -17,6 +17,7 @@ class ExecutionMetadata(TypedDict, total=False):
     retry_count: int
     status: str  # "ok" | "error" | "retry" | "failed"
     last_error_node: str
+    resume_node: str  # where handle_error routes a retry
 
 
 class AgentState(TypedDict):

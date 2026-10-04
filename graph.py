@@ -14,7 +14,10 @@ def _route_on_status(state: AgentState) -> str:
 
 
 def _route_after_error(state: AgentState) -> str:
-    return "retry" if state["execution_metadata"].get("status") == "retry" else "exit"
+    metadata = state["execution_metadata"]
+    if metadata.get("status") != "retry":
+        return "exit"
+    return metadata.get("resume_node", "research_account")
 
 
 def build_graph(checkpointer=None) -> CompiledStateGraph:
@@ -40,10 +43,10 @@ def build_graph(checkpointer=None) -> CompiledStateGraph:
     graph.add_conditional_edges(
         "handle_error",
         _route_after_error,
-        # On failure we retry from research_account (the pipeline's entry
-        # point) rather than the specific node that failed, since research
-        # data is a prerequisite for every downstream step.
-        {"retry": "research_account", "exit": END},
+        # Retry resumes at the node that failed when its inputs are intact
+        # (an outreach failure doesn't redo research); otherwise it restarts
+        # from research_account, which every downstream step depends on.
+        {"research_account": "research_account", "generate_outreach": "generate_outreach", "exit": END},
     )
     graph.add_edge("sync_crm", END)
 
