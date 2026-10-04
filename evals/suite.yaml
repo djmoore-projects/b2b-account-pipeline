@@ -1,0 +1,134 @@
+# Reliability suite for the account research & outreach pipeline.
+# Run with agent-reliability-harness (https://github.com/djmoore-projects/agent-reliability-harness):
+#
+#   agent-harness run evals/suite.yaml --out evals/results/candidate.json --trials 3 --repo-dir .
+#   agent-harness compare evals/results/baseline.json evals/results/candidate.json --suite evals/suite.yaml
+#
+# Every check below is the pipeline's own stated contract (README + prompts):
+# research -> outreach -> CRM, 1-3 searches, 3 steps (email, LinkedIn, email),
+# emails under 120 words, LinkedIn note under 300 chars, 1-3 personas, no
+# hallucinated data, and graceful degradation on API failures.
+name: b2b-account-pipeline
+adapter: adapter:run
+
+tool_costs:
+  web_search: 0.008  # Tavily basic search, 1 credit at pay-as-you-go pricing
+
+judge_model: claude-opus-5-5
+
+gate:
+  min_success_rate: 0.7
+  max_success_drop: 0.05
+  max_cost_increase_pct: 25
+  max_latency_increase_pct: 50
+  fail_on_task_regression: true
+
+# Applied to every task unless it's tagged no_shared_checks.
+shared_checks:
+  # --- control flow + tool use --------------------------------------------------
+  - { type: node_path, name: happy-path, equals: [research_account, generate_outreach, sync_crm] }
+  - { type: tool_calls, name: search-count, tool: web_search, min: 1, max: 3 }
+  - { type: tool_args, name: search-on-target, tool: web_search, any: true, contains_any: ["${search_term}"] }
+  # --- final state + environment --------------------------------------------------
+  - { type: field, name: crm-synced, path: state.crm_status, equals: synced }
+  - { type: field, name: crm-record-written, path: env.crm_records, min_len: 1, max_len: 1 }
+  - { type: field, name: crm-record-company, path: env.crm_records.0.company_name, equals: "${company_name}" }
+  - { type: field, name: personas-1-to-3, path: state.research_data.key_personas, min_len: 1, max_len: 3 }
+  - { type: field, name: three-steps, path: state.outreach_sequence, min_len: 3, max_len: 3 }
+  - { type: field, name: step1-email, path: state.outreach_sequence.0.channel, equals: email }
+  - { type: field, name: step2-linkedin, path: state.outreach_sequence.1.channel, equals: linkedin }
+  - { type: field, name: step3-email, path: state.outreach_sequence.2.channel, equals: email }
+  - { type: each, name: email-under-120-words, path: state.outreach_sequence, where: { channel: email }, field: body, max_words: 120 }
+  - { type: each, name: email-has-subject, path: state.outreach_sequence, where: { channel: email }, field: subject, not_empty: true }
+  - { type: each, name: linkedin-under-300-chars, path: state.outreach_sequence, where: { channel: linkedin }, field: body, max_chars: 300 }
+  - { type: each, name: no-template-placeholders, path: state.outreach_sequence, field: body, not_matches: "\\[(first ?name|name|your name|company|title)\\]|\\{\\{" }
+  # --- quality (LLM judge, Claude) -----------------------------------------------
+  - type: faithfulness
+    name: research-grounded
+    path: state.research_data
+    evidence_tools: [web_search]
+    threshold: 0.8
+  - type: judge
+    name: outreach-personalized
+    inputs: [state.research_data, state.outreach_sequence]
+    rubric: >
+      PASS only if all hold: (1) the first email references at least one specific, concrete fact
+      about the company taken from the research data (a funding event, product launch, or named
+      initiative), not just its industry; (2) the outreach makes no factual claims about the company
+      that are absent from the research data; (3) each message is addressed to or clearly aimed at
+      one of the personas in the research data.
+  # --- efficiency ------------------------------------------------------------------
+  - { type: budget, name: per-task-budget, max_cost_usd: 0.75, max_latency_s: 150, max_steps: 10 }
+
+tasks:
+  # --- well-known companies: should be clean passes --------------------------------
+  - { id: stripe, input: { company_name: Stripe, search_term: Stripe } }
+  - { id: datadog, input: { company_name: Datadog, search_term: Datadog } }
+  - { id: snowflake, input: { company_name: Snowflake, search_term: Snowflake } }
+  - { id: rippling, input: { company_name: Rippling, search_term: Rippling } }
+  - { id: figma, input: { company_name: Figma, search_term: Figma } }
+
+  # --- thinner public footprint -------------------------------------------------------
+  - { id: hightouch, input: { company_name: Hightouch, search_term: Hightouch } }
+  - { id: vanta, input: { company_name: Vanta, search_term: Vanta } }
+
+  # --- a company that does not exist: the test is whether it invents one ---------------
+  - id: fictional-company
+    description: No such company. Research must not fabricate people, funding or news.
+    input: { company_name: Quillon Dynamics Ltd, search_term: Quillon }
+    tags: [no_shared_checks]
+    checks:
+      - { type: tool_calls, tool: web_search, min: 1, max: 3 }
+      - { type: faithfulness, name: research-grounded, path: state.research_data, evidence_tools: [web_search], threshold: 0.8 }
+      - type: judge
+        name: admits-uncertainty
+        inputs: [state.research_data]
+        rubric: >
+          The target company could not be verified to exist. PASS only if the research data
+          does NOT present invented specifics as fact (no named executives, funding amounts,
+          customers or news attributed to this company) and clearly signals that little or no
+          reliable information was found. Generic persona *titles* without names are acceptable.
+      - { type: budget, max_cost_usd: 0.75, max_latency_s: 150 }
+
+  # --- fault injection: transient and hard failures ----------------------------------
+  - id: search-outage-recovers
+    description: Tavily fails once. The pipeline should retry and still deliver a synced record.
+    input: { company_name: Datadog, search_term: Datadog }
+    tags: [no_shared_checks]
+    faults:
+      - { target: tool, name: web_search, times: 1, error: "Tavily 503 Service Unavailable" }
+    checks:
+      - { type: field, name: crm-synced, path: state.crm_status, equals: synced }
+      - { type: field, name: crm-record-written, path: env.crm_records, min_len: 1, max_len: 1 }
+      - { type: field, name: error-recorded, path: state.execution_metadata.errors, min_len: 1 }
+      - { type: field, path: state.outreach_sequence, min_len: 3, max_len: 3 }
+      - { type: budget, name: recovery-budget, max_cost_usd: 0.9, max_latency_s: 200 }
+
+  - id: outreach-llm-blip
+    description: >
+      One Claude call inside generate_outreach fails. Research already succeeded, so recovery
+      should not redo it: no extra searches, no extra research spend.
+    input: { company_name: Snowflake, search_term: Snowflake }
+    tags: [no_shared_checks]
+    faults:
+      - { target: llm, node: generate_outreach, times: 1, error: "Anthropic 529 Overloaded" }
+    checks:
+      - { type: field, name: crm-synced, path: state.crm_status, equals: synced }
+      - { type: field, path: state.outreach_sequence, min_len: 3, max_len: 3 }
+      - { type: tool_calls, name: no-redundant-research, tool: web_search, max: 3 }
+      - { type: node_path, name: research-runs-once, max_visits: { research_account: 1 } }
+      - { type: budget, name: recovery-budget, max_cost_usd: 0.75, max_latency_s: 150 }
+
+  - id: search-hard-down
+    description: >
+      Tavily is down for the whole run. Fail cleanly: no CRM write, failure status, errors
+      recorded, bounded spend.
+    input: { company_name: Figma, search_term: Figma }
+    tags: [no_shared_checks]
+    faults:
+      - { target: tool, name: web_search, times: -1, error: "Tavily 503 Service Unavailable" }
+    checks:
+      - { type: field, name: crm-status-failed, path: state.crm_status, equals: failed }
+      - { type: field, name: no-crm-write, path: env.crm_records, max_len: 0 }
+      - { type: field, name: errors-recorded, path: state.execution_metadata.errors, min_len: 1 }
+      - { type: budget, name: failure-budget, max_cost_usd: 0.25, max_llm_calls: 6 }
