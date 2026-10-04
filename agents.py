@@ -14,9 +14,10 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import Literal
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -64,10 +65,10 @@ def timed_node(name: str) -> Callable:
             start = time.perf_counter()
             try:
                 update = fn(state)
-            except Exception as exc:  # noqa: BLE001 - node failures must not crash the graph
+            except Exception as exc:
                 durations[name] = time.perf_counter() - start
                 errors.append(f"{name}: {exc}")
-                logger.error("Node '%s' failed: %s", name, exc, exc_info=True)
+                logger.exception("Node '%s' failed", name)
                 metadata.update(
                     node_durations=durations,
                     errors=errors,
@@ -90,7 +91,7 @@ def timed_node(name: str) -> Callable:
 # Tavily search tool
 # ---------------------------------------------------------------------------
 
-_tavily_client: Optional[TavilyClient] = None
+_tavily_client: TavilyClient | None = None
 
 
 def _get_tavily_client() -> TavilyClient:
@@ -133,7 +134,7 @@ class Persona(BaseModel):
 class ResearchData(BaseModel):
     company_name: str
     industry: str = Field(description="Best-guess industry / vertical")
-    recent_funding: Optional[str] = Field(default=None, description="Most recent funding round and amount, if found")
+    recent_funding: str | None = Field(default=None, description="Most recent funding round and amount, if found")
     recent_news: list[str] = Field(default_factory=list, description="2-5 recent, notable news bullet points")
     key_personas: list[Persona] = Field(default_factory=list, description="1-3 likely buying-committee contacts")
     summary: str = Field(description="2-3 sentence synthesis an SDR could read in 10 seconds")
@@ -142,7 +143,7 @@ class ResearchData(BaseModel):
 class OutreachStep(BaseModel):
     step_number: int
     channel: Literal["email", "linkedin"]
-    subject: Optional[str] = Field(default=None, description="Email subject line; null for LinkedIn steps")
+    subject: str | None = Field(default=None, description="Email subject line; null for LinkedIn steps")
     body: str = Field(description="Message body, personalized using the research data")
 
 

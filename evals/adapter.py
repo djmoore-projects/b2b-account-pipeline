@@ -17,9 +17,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import agents  # noqa: E402
-from graph import build_graph  # noqa: E402
-from main import _initial_state  # noqa: E402
+import agents
+from graph import build_graph
+from main import _initial_state
 
 _CRM_STORE: contextvars.ContextVar[Path] = contextvars.ContextVar("crm_store")
 _OriginalCRM = agents.MockCRMClient
