@@ -161,20 +161,62 @@ changes needed either way.
 | `graph.py` | `StateGraph` wiring: nodes, conditional edges, compilation |
 | `main.py` | Entry point, checkpointer setup, benchmark timer and report |
 
+## Reliability evals
+
+`evals/` holds a task suite for
+[agent-reliability-harness](https://github.com/djmoore-projects/agent-reliability-harness).
+It runs the real graph (live Claude + Tavily) and grades every run on tool
+use, final state, the CRM record actually written, outreach contract, grounding
+(claim-level, against what the searches returned), cost, latency and steps.
+Three tasks inject faults (a transient Tavily outage, a Claude failure inside
+`generate_outreach`, Tavily down for the whole run).
+
+```bash
+pip install "agent-reliability-harness @ git+https://github.com/djmoore-projects/agent-reliability-harness"
+agent-harness run evals/suite.yaml --out evals/results/candidate.json --trials 3 --repo-dir .
+agent-harness compare evals/results/baseline.json evals/results/candidate.json --suite evals/suite.yaml
+```
+
+`.github/workflows/agent-eval.yml` runs it on PRs that touch the agent and fails
+the check on regression (it skips cleanly when the API-key secrets aren't set).
+
+**What the baseline found** (original code, [`evals/results/baseline.md`](evals/results/baseline.md)):
+task success was **17%** (3 of 18 clean trials; 95% CI 6–39%). The run lost 15 of
+its 33 trials to an exhausted API credit balance; the harness flags and excludes
+those, so the baseline is partial. All 13 clean happy-path trials (7 real companies) failed:
+
+| Failure | Trials hit | Cause |
+|---|---|---|
+| Outreach shipped with `[Name]` / `[Your Name]` placeholders | 13 / 13 | Nothing enforced "send-ready"; the prompt didn't forbid placeholders |
+| More than 3 searches | 4 / 13 | The cap was on loop *iterations*, but Claude issues parallel tool calls per iteration |
+| Research claims not supported by search results (<80% of claims grounded) | 3 / 14 | Model filled gaps from prior knowledge |
+| Fictional company got a real company's execs, funding and news | 1 / 1 | Similarly named company in results, no entity check |
+| An LLM blip in outreach re-ran all research: 8 searches, 108s, $0.41 vs ~$0.18 typical | 1 / 1 | Retry always restarted from `research_account` |
+
+The fixes on this branch target exactly those: search *count* budget, resume
+from the failed node, a code-enforced outreach contract with one repair pass,
+and an entity-grounding instruction. The after-fix run is pending (it needs
+API credit), so there are no "after" numbers here yet.
+
 ## Design notes
 
-- **Error routing restarts from `research_account`**, not the failing node
-  in place, because every downstream node depends on research data being
-  present — a partial retry of just `generate_outreach` after a transient
-  research failure would operate on stale/incomplete data.
+- **Retries resume at the failed node when its inputs are intact.** An
+  outreach failure with research already in state retries `generate_outreach`
+  only; anything else restarts from `research_account`, which every
+  downstream step depends on. (Originally every retry restarted from research;
+  the eval suite's `outreach-llm-blip` task showed that doubled cost and latency
+  on a single transient error.)
 - **Structured output over prompted JSON.** Both `research_account` and
   `generate_outreach` use `ChatAnthropic.with_structured_output(...)` against
   Pydantic schemas rather than asking the model to "return JSON" — this
   guarantees parseable, typed output instead of relying on prompt
   compliance.
+- **Contracts in code, not just prompts.** Outreach length limits, channel
+  order and "no placeholders" are checked by `outreach_violations()` after
+  generation, with one targeted repair pass if the draft breaks them.
 - **Bounded tool loop.** The research node caps tool-calling at 3 iterations
-  to keep latency predictable; Claude is instructed to search efficiently
-  (1-3 targeted queries) and stop once it has enough to write a brief.
+  *and* 3 total searches (Claude can request several searches in one turn), to
+  keep latency and spend predictable.
 
 ## Contributing
 

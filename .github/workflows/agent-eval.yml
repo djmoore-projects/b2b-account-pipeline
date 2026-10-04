@@ -1,0 +1,64 @@
+name: Agent reliability gate
+
+# Runs the live eval suite on PRs that touch the agent, compares against the
+# committed baseline, posts the report as a PR comment, and fails the check if
+# task success, cost, latency, or any previously-passing task regresses.
+#
+# Requires repository secrets ANTHROPIC_API_KEY and TAVILY_API_KEY. Without
+# them the job is skipped (forks, first-time setup) instead of failing.
+
+on:
+  pull_request:
+    paths:
+      - "agents.py"
+      - "graph.py"
+      - "state.py"
+      - "requirements.txt"
+      - "evals/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: agent-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+    steps:
+      - name: Skip when secrets are unavailable
+        id: secrets
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$TAVILY_API_KEY" ]; then
+            echo "::notice::ANTHROPIC_API_KEY / TAVILY_API_KEY not set; skipping live agent eval."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.secrets.outputs.ok == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.secrets.outputs.ok == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+        if: steps.secrets.outputs.ok == 'true'
+
+      - uses: djmoore-projects/agent-reliability-harness@main
+        if: steps.secrets.outputs.ok == 'true'
+        with:
+          suite: evals/suite.yaml
+          baseline: evals/results/baseline.json
+          trials: "1"        # 3 for release branches; 1 keeps PR runs ~2-3 min and ~$4
+          concurrency: "6"

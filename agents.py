@@ -11,11 +11,13 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import Literal
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -37,6 +39,7 @@ logger = logging.getLogger("pipeline")
 # per-token cost and latency.
 DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
 MAX_TOOL_ITERATIONS = 3
+MAX_SEARCHES = 3  # total web_search calls per research run, including parallel calls
 MAX_RETRIES = 2
 
 
@@ -62,10 +65,10 @@ def timed_node(name: str) -> Callable:
             start = time.perf_counter()
             try:
                 update = fn(state)
-            except Exception as exc:  # noqa: BLE001 - node failures must not crash the graph
+            except Exception as exc:
                 durations[name] = time.perf_counter() - start
                 errors.append(f"{name}: {exc}")
-                logger.error("Node '%s' failed: %s", name, exc, exc_info=True)
+                logger.exception("Node '%s' failed", name)
                 metadata.update(
                     node_durations=durations,
                     errors=errors,
@@ -88,7 +91,7 @@ def timed_node(name: str) -> Callable:
 # Tavily search tool
 # ---------------------------------------------------------------------------
 
-_tavily_client: Optional[TavilyClient] = None
+_tavily_client: TavilyClient | None = None
 
 
 def _get_tavily_client() -> TavilyClient:
@@ -123,7 +126,7 @@ def web_search(query: str) -> str:
 
 
 class Persona(BaseModel):
-    name: str = Field(description="Full name of the person")
+    name: str = Field(description='Full name as it appears in the search results, or "Unknown" if not found')
     title: str = Field(description="Job title / role")
     relevance: str = Field(description="Why this person matters for outreach, e.g. economic buyer, champion")
 
@@ -131,7 +134,7 @@ class Persona(BaseModel):
 class ResearchData(BaseModel):
     company_name: str
     industry: str = Field(description="Best-guess industry / vertical")
-    recent_funding: Optional[str] = Field(default=None, description="Most recent funding round and amount, if found")
+    recent_funding: str | None = Field(default=None, description="Most recent funding round and amount, if found")
     recent_news: list[str] = Field(default_factory=list, description="2-5 recent, notable news bullet points")
     key_personas: list[Persona] = Field(default_factory=list, description="1-3 likely buying-committee contacts")
     summary: str = Field(description="2-3 sentence synthesis an SDR could read in 10 seconds")
@@ -140,7 +143,7 @@ class ResearchData(BaseModel):
 class OutreachStep(BaseModel):
     step_number: int
     channel: Literal["email", "linkedin"]
-    subject: Optional[str] = Field(default=None, description="Email subject line; null for LinkedIn steps")
+    subject: str | None = Field(default=None, description="Email subject line; null for LinkedIn steps")
     body: str = Field(description="Message body, personalized using the research data")
 
 
@@ -157,9 +160,14 @@ class OutreachSequence(BaseModel):
 RESEARCH_SYSTEM_PROMPT = """You are a B2B account research analyst. Use the \
 web_search tool to gather recent, specific information about the target company: \
 funding history, recent news/product launches, and likely buying-committee personas \
-(titles, not necessarily named individuals if names aren't findable). Search efficiently \
-— 1-3 targeted queries is usually enough. Once you have enough to write a useful \
-briefing, stop searching and summarize."""
+(titles, not necessarily named individuals if names aren't findable). You have a budget \
+of at most 3 searches in total, so make each query count. Once you have enough to write a \
+useful briefing, stop searching and summarize.
+
+Only report facts that the search results attribute to this exact company. Results about \
+similarly named companies are not evidence; don't borrow their people, funding, or news. If \
+you can't find reliable information about the target, say so plainly in the summary, leave \
+funding and news empty, and list personas by likely title with the name "Unknown"."""
 
 
 @timed_node("research_account")
@@ -173,14 +181,23 @@ def research_account(state: AgentState) -> dict:
         HumanMessage(content=f"Research the company: {company}"),
     ]
 
+    searches = 0
     for _ in range(MAX_TOOL_ITERATIONS):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
         if not response.tool_calls:
             break
+        # Claude can request several searches in one turn, so the iteration cap alone
+        # doesn't bound search count. Every tool_call still needs a ToolMessage reply.
         for tool_call in response.tool_calls:
-            result = web_search.invoke(tool_call["args"])
+            if searches >= MAX_SEARCHES:
+                result = "Search budget exhausted. Summarize using the results you already have."
+            else:
+                result = web_search.invoke(tool_call["args"])
+                searches += 1
             messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
+        if searches >= MAX_SEARCHES:
+            break
 
     structured_llm = get_llm().with_structured_output(ResearchData)
     research: ResearchData = structured_llm.invoke(
@@ -199,7 +216,37 @@ OUTREACH_SYSTEM_PROMPT = """You are an SDR writing a highly personalized, 3-step
 outreach sequence: (1) an initial email, (2) a LinkedIn connection request note, \
 (3) a brief follow-up email. Reference specific details from the research data \
 (funding, news, persona context) — avoid generic templates. Keep emails under 120 \
-words and the LinkedIn note under 300 characters."""
+words and the LinkedIn note under 300 characters.
+
+Every factual statement about the company must come from the research data; do not \
+add numbers, launches, or claims that aren't in it. Address each message to a persona \
+from the research data. These messages are sent as-is: never use placeholders like \
+[Name] or [Your Name], and sign emails off with just "Best,"."""
+
+EXPECTED_CHANNELS = ["email", "linkedin", "email"]
+MAX_EMAIL_WORDS = 120
+MAX_LINKEDIN_CHARS = 300
+_PLACEHOLDER = re.compile(r"\[[^\]]{1,40}\]|\{\{.*?\}\}")
+
+
+def outreach_violations(steps: list[OutreachStep]) -> list[str]:
+    """Check the sequence against the outreach contract. Prompted limits drift; this doesn't."""
+    problems = []
+    channels = [s.channel for s in steps]
+    if channels != EXPECTED_CHANNELS:
+        problems.append(f"channels must be {EXPECTED_CHANNELS}, got {channels}")
+    for i, step in enumerate(steps, start=1):
+        if step.channel == "email":
+            words = len(step.body.split())
+            if words > MAX_EMAIL_WORDS:
+                problems.append(f"step {i} email is {words} words; max is {MAX_EMAIL_WORDS}")
+            if not step.subject:
+                problems.append(f"step {i} email needs a subject line")
+        elif len(step.body) > MAX_LINKEDIN_CHARS:
+            problems.append(f"step {i} LinkedIn note is {len(step.body)} chars; max is {MAX_LINKEDIN_CHARS}")
+        if placeholders := _PLACEHOLDER.findall(step.body + " " + (step.subject or "")):
+            problems.append(f"step {i} contains unfilled placeholders {placeholders}")
+    return problems
 
 
 @timed_node("generate_outreach")
@@ -212,9 +259,20 @@ def generate_outreach(state: AgentState) -> dict:
         f"Research data:\n{json.dumps(research_data, indent=2)}\n\n"
         "Write the 3-step outreach sequence."
     )
-    sequence: OutreachSequence = llm.invoke(
-        [SystemMessage(content=OUTREACH_SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    )
+    messages = [SystemMessage(content=OUTREACH_SYSTEM_PROMPT), HumanMessage(content=prompt)]
+    sequence: OutreachSequence = llm.invoke(messages)
+
+    # One targeted repair pass if the draft breaks the contract.
+    problems = outreach_violations(sequence.steps)
+    if problems:
+        logger.warning("Outreach draft violated contract, repairing: %s", problems)
+        draft = json.dumps([step.model_dump() for step in sequence.steps], indent=2)
+        sequence = llm.invoke(messages + [HumanMessage(content=(
+            f"Your draft:\n{draft}\n\nFix these problems and return the full corrected sequence:\n- "
+            + "\n- ".join(problems)
+        ))])
+        if remaining := outreach_violations(sequence.steps):
+            logger.warning("Outreach still violates contract after repair: %s", remaining)
 
     logger.info("Generated %d-step outreach sequence", len(sequence.steps))
     return {"outreach_sequence": [step.model_dump() for step in sequence.steps]}
@@ -283,6 +341,13 @@ def handle_error(state: AgentState) -> dict:
 
     if retry_count <= MAX_RETRIES:
         metadata["status"] = "retry"
+        # Resume where it failed if that node's inputs are already in state; only
+        # fall back to re-running research when research itself didn't complete.
+        failed_node = metadata.get("last_error_node")
+        research_done = bool(state.get("research_data"))
+        metadata["resume_node"] = (
+            failed_node if failed_node == "generate_outreach" and research_done else "research_account"
+        )
         logger.warning(
             "Error in '%s' — retrying pipeline (attempt %d/%d)",
             metadata.get("last_error_node", "unknown"),
